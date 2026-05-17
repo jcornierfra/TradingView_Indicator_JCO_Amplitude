@@ -1,0 +1,274 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jcornier
+//
+// Version: 2.1.3 (port Pine du Tradovate Indicator_JCO_Amplitude v2.1.3)
+// GitHub:  https://github.com/jcornierfra/TradingView_Indicator_JCO_Amplitude
+//
+// Description: Port TradingView de l'indicateur d'amplitude Tradovate.
+//              Travaille sur la timeframe du graphique (1 minute recommandee
+//              pour approximer le tick-by-tick : on utilise high/low des
+//              bougies, et la bougie en cours sert de bougie de droite
+//              pour la detection de swing comme dans la version Tradovate).
+//
+//              Mecanique a deux phases (identique a la version JS) :
+//
+//                Phase 1 (searching) - 1ere marque du jour
+//                  Detection du dernier swing valide (leftBars/rightBars,
+//                  extrema stricts). Depuis le swing, on attend qu'amp1
+//                  soit atteint dans le sens oppose. Marque posee au prix
+//                  exact swing.price +/- amp1 -> passage en phase 2.
+//
+//                Phase 2 (tracking) - cycle apres la 1ere marque
+//                  Etat (pour direction 'up' ; symetrique en down) :
+//                    - origin       : ancre du calcul des 30%
+//                    - refExtreme   : plus haut atteint depuis la marque
+//                    - oppExtreme   : plus bas atteint depuis la marque
+//                                     (monotone, sert au continuation)
+//                    - localOpp     : plus bas depuis dernier reset de
+//                                     refExtreme (sert au reversal)
+//                    - recoveryExt  : plus haut depuis dernier reset
+//                                     d'oppExtreme
+//                    - currentPath  : 'amp1' | 'amp2', sticky, fige sur
+//                                     baisse d'oppExtreme
+//                    - retracementSeen : true des qu'oppExt a strictement
+//                                        bouge
+//
+//                  Path : reevalue UNIQUEMENT quand oppExtreme baisse.
+//                    retrace > 30% * (refExt - origin) -> amp1, sinon amp2
+//
+//                  Deux regles (par priorite) :
+//                    1. Reversal (seuil amp1 toujours, si retracementSeen):
+//                         localRetrace = refExt - localOpp >= amp1
+//                       -> marque amp1, couleur opposee, direction inversee
+//                    2. Continuation (path-driven):
+//                         recovery = recoveryExt - oppExt >= amp_path
+//                       -> marque amp_path, meme couleur
+//
+//              Code couleur (lecture contrarienne) :
+//                - Mouvement BAS -> HAUT  -> marque ROUGE (signal vente)
+//                - Mouvement HAUT -> BAS  -> marque VERTE (signal achat)
+//
+//              Fenetre d'affichage [startHour - endHour] (defaut 08h-22h
+//              Europe/Paris). Reset journalier a minuit Paris.
+//
+// Note Pine : sur les bougies confirmees l'etat persiste normalement.
+//             En realtime, Pine re-execute le script depuis l'etat de la
+//             bougie precedente confirmee a chaque tick : un seul marker
+//             par minute en intra-bar (acceptable en 1 min).
+
+//@version=6
+indicator("JCO Amplitude", "JCO Amplitude", overlay=true, max_lines_count=500)
+
+// === Inputs ===
+amp1Pts         = input.float(80,   "Amp1 (1ere / reversal)",         minval=1,    group="Amplitudes")
+amp2Pts         = input.float(60,   "Amp2 (continuation)",            minval=1,    group="Amplitudes")
+pointSize       = input.float(1.0,  "Prix par point (NQ/MNQ/ES = 1)", minval=0.01, step=0.05, group="Amplitudes")
+
+leftBars        = input.int(1,      "Swing left bars",                minval=1, maxval=20, group="Swing")
+rightBars       = input.int(1,      "Swing right bars",               minval=1, maxval=20, group="Swing")
+
+startHour       = input.int(8,      "Debut (Paris) h",                minval=0, maxval=23, group="Fenetre", inline="start")
+startMinute     = input.int(0,      "min",                            minval=0, maxval=59, group="Fenetre", inline="start")
+endHour         = input.int(22,     "Fin   (Paris) h",                minval=0, maxval=24, group="Fenetre", inline="end")
+endMinute       = input.int(0,      "min",                            minval=0, maxval=59, group="Fenetre", inline="end")
+
+markerWidthBars = input.float(1.4,  "Largeur marque (bars)",          minval=0.5, step=0.1, group="Affichage")
+lineWidth       = input.int(2,      "Epaisseur trait",                minval=1, maxval=10, group="Affichage")
+bullColor       = input.color(color.new(#00C853, 10), "Couleur haussiere (signal achat)",   group="Affichage")
+bearColor       = input.color(color.new(#FF1744, 10), "Couleur baissiere (signal vente)",   group="Affichage")
+
+// === State (persiste entre les bougies) ===
+var string phase           = "searching"   // "searching" | "tracking"
+var string direction       = na            // "up" (mvt haussier, marque rouge) | "down" (mvt baissier, marque verte)
+var float  activeAmpPts    = na
+var float  origin          = na
+var float  refExtreme      = na
+var float  oppExtreme      = na
+var float  localOpp        = na
+var float  recoveryExt     = na
+var bool   retracementSeen = false
+var string currentPath     = "amp2"        // "amp1" | "amp2"
+var float  swingPrice      = na
+var int    swingTime       = na
+var string swingType       = na            // "low" | "high"
+
+// === Reset journalier (minuit Europe/Paris) ===
+// Pine v6 n'expose pas dayofyear() : on construit une cle unique annee*10000 + mois*100 + jour.
+dayKey = year(time, "Europe/Paris") * 10000 + month(time, "Europe/Paris") * 100 + dayofmonth(time, "Europe/Paris")
+dayChanged = ta.change(dayKey)
+if not na(dayChanged) and dayChanged != 0
+    phase           := "searching"
+    direction       := na
+    activeAmpPts    := na
+    origin          := na
+    refExtreme      := na
+    oppExtreme      := na
+    localOpp        := na
+    recoveryExt     := na
+    retracementSeen := false
+    currentPath     := "amp2"
+    swingPrice      := na
+    swingTime       := na
+    swingType       := na
+
+// === Helper de dessin ===
+// Trait horizontal au prix exact de declenchement, centre sur la bougie.
+f_drawMarker(triggerPrice, useBearColor) =>
+    tfSec = timeframe.in_seconds(timeframe.period)
+    tfMs = (tfSec > 0 ? tfSec : 60) * 1000
+    halfW = int(math.round(tfMs * markerWidthBars / 2.0))
+    col = useBearColor ? bearColor : bullColor
+    line.new(x1=time - halfW, y1=triggerPrice, x2=time + halfW, y2=triggerPrice,
+             xloc=xloc.bar_time, color=col, width=lineWidth)
+
+// === Detection swing (phase searching uniquement) ===
+// pivot a `rightBars` bougies en arriere, strict vs leftBars a gauche
+// ET rightBars a droite. La bougie en cours (offset 0) compte comme
+// bougie de droite, comme dans la version Tradovate.
+if phase == "searching" and bar_index >= leftBars + rightBars
+    int pivotIdx = rightBars
+    float pivotHigh = high[pivotIdx]
+    float pivotLow  = low[pivotIdx]
+    bool isSwingLow  = true
+    bool isSwingHigh = true
+    for k = 1 to leftBars
+        if low[pivotIdx + k] <= pivotLow
+            isSwingLow := false
+        if high[pivotIdx + k] >= pivotHigh
+            isSwingHigh := false
+    for k = 1 to rightBars
+        if low[pivotIdx - k] <= pivotLow
+            isSwingLow := false
+        if high[pivotIdx - k] >= pivotHigh
+            isSwingHigh := false
+    int pivotTime = time[pivotIdx]
+    if isSwingLow
+        if na(swingTime) or swingTime != pivotTime or swingType != "low"
+            swingPrice := pivotLow
+            swingTime  := pivotTime
+            swingType  := "low"
+    else if isSwingHigh
+        if na(swingTime) or swingTime != pivotTime or swingType != "high"
+            swingPrice := pivotHigh
+            swingTime  := pivotTime
+            swingType  := "high"
+
+// === Verification amplitude ===
+minutesNow = hour(time, "Europe/Paris") * 60 + minute(time, "Europe/Paris")
+startMins  = startHour * 60 + startMinute
+endMins    = endHour   * 60 + endMinute
+inWindow   = minutesNow >= startMins and minutesNow < endMins
+
+amp1Price = amp1Pts * pointSize
+amp2Price = amp2Pts * pointSize
+
+if inWindow
+    // -------- Phase 1 : searching --------
+    if phase == "searching" and not na(swingPrice)
+        if swingType == "low"
+            float triggerPrice = swingPrice + amp1Price
+            if high >= triggerPrice
+                f_drawMarker(triggerPrice, true)   // mvt up -> marque ROUGE
+                phase           := "tracking"
+                direction       := "up"
+                origin          := swingPrice
+                activeAmpPts    := amp1Pts
+                refExtreme      := triggerPrice
+                oppExtreme      := triggerPrice
+                localOpp        := triggerPrice
+                recoveryExt     := triggerPrice
+                retracementSeen := false
+                currentPath     := "amp2"
+        else if swingType == "high"
+            float triggerPrice = swingPrice - amp1Price
+            if low <= triggerPrice
+                f_drawMarker(triggerPrice, false)  // mvt down -> marque VERTE
+                phase           := "tracking"
+                direction       := "down"
+                origin          := swingPrice
+                activeAmpPts    := amp1Pts
+                refExtreme      := triggerPrice
+                oppExtreme      := triggerPrice
+                localOpp        := triggerPrice
+                recoveryExt     := triggerPrice
+                retracementSeen := false
+                currentPath     := "amp2"
+    // -------- Phase 2 : tracking --------
+    else if phase == "tracking"
+        // 1) Mise a jour des extremes
+        bool oppDropped = false
+        if direction == "up"
+            if high > refExtreme
+                refExtreme := high
+                localOpp   := refExtreme    // reset localOpp sur nouveau plus haut
+            if low < localOpp
+                localOpp := low
+            if low < oppExtreme
+                oppExtreme      := low
+                recoveryExt     := low
+                retracementSeen := true
+                oppDropped      := true
+            if high > recoveryExt
+                recoveryExt := high
+        else
+            if low < refExtreme
+                refExtreme := low
+                localOpp   := refExtreme    // reset localOpp sur nouveau plus bas
+            if high > localOpp
+                localOpp := high
+            if high > oppExtreme
+                oppExtreme      := high
+                recoveryExt     := high
+                retracementSeen := true
+                oppDropped      := true
+            if low < recoveryExt
+                recoveryExt := low
+
+        // 2) Distances signees (toujours positives)
+        float retrace      = direction == "up" ? refExtreme  - oppExtreme  : oppExtreme - refExtreme
+        float localRetrace = direction == "up" ? refExtreme  - localOpp    : localOpp   - refExtreme
+        float recovery     = direction == "up" ? recoveryExt - oppExtreme  : oppExtreme - recoveryExt
+        float totalMove    = direction == "up" ? refExtreme  - origin      : origin     - refExtreme
+
+        // 3) Re-evaluation du path uniquement sur baisse d'oppExtreme
+        if oppDropped
+            currentPath := retrace > 0.30 * totalMove ? "amp1" : "amp2"
+
+        // 4) Regles par priorite
+        bool markPlaced = false
+
+        // Regle 1 : Reversal (seuil = amp1 TOUJOURS, requiert un vrai retracement)
+        if retracementSeen and localRetrace >= amp1Price
+            float revTrigger = direction == "up" ? refExtreme - amp1Price : refExtreme + amp1Price
+            string newDirection = direction == "up" ? "down" : "up"
+            bool useBearColor = newDirection == "up"
+            f_drawMarker(revTrigger, useBearColor)
+            float newOrigin = refExtreme
+            direction       := newDirection
+            origin          := newOrigin
+            activeAmpPts    := amp1Pts
+            refExtreme      := revTrigger
+            oppExtreme      := revTrigger
+            localOpp        := revTrigger
+            recoveryExt     := revTrigger
+            retracementSeen := false
+            currentPath     := "amp2"
+            markPlaced      := true
+
+        // Regle 2 : Continuation (path-driven : amp1 ou amp2 selon currentPath)
+        if not markPlaced
+            float ampPathPrice = currentPath == "amp1" ? amp1Price : amp2Price
+            float ampPathPts   = currentPath == "amp1" ? amp1Pts   : amp2Pts
+            if recovery >= ampPathPrice
+                float contTrigger = direction == "up" ? oppExtreme + ampPathPrice : oppExtreme - ampPathPrice
+                bool useBearColor = direction == "up"
+                f_drawMarker(contTrigger, useBearColor)
+                float newOrigin = oppExtreme
+                origin          := newOrigin
+                activeAmpPts    := ampPathPts
+                refExtreme      := contTrigger
+                oppExtreme      := contTrigger
+                localOpp        := contTrigger
+                recoveryExt     := contTrigger
+                retracementSeen := false
+                currentPath     := "amp2"
