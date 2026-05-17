@@ -1,14 +1,16 @@
 // This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © jcornier
 //
-// Version: 2.1.3 (port Pine du Tradovate Indicator_JCO_Amplitude v2.1.3)
+// Version: 2.2.0 (port Pine du Tradovate Indicator_JCO_Amplitude v2.1.3)
 // GitHub:  https://github.com/jcornierfra/TradingView_Indicator_JCO_Amplitude
 //
 // Description: Port TradingView de l'indicateur d'amplitude Tradovate.
-//              Travaille sur la timeframe du graphique (1 minute recommandee
-//              pour approximer le tick-by-tick : on utilise high/low des
-//              bougies, et la bougie en cours sert de bougie de droite
-//              pour la detection de swing comme dans la version Tradovate).
+//              Force la timeframe M1 quelle que soit la TF du chart via
+//              request.security_lower_tf(). Permet d'utiliser le chart en
+//              M5 / M15 / H1 etc. pour le contexte, tout en gardant des
+//              marques posees aux instants et prix exacts du declenchement
+//              M1. Si la TF du chart est < M1 (sub-minute), on retombe sur
+//              la TF du chart (impossible de descendre dessous).
 //
 //              Mecanique a deux phases (identique a la version JS) :
 //
@@ -48,13 +50,31 @@
 //                - Mouvement BAS -> HAUT  -> marque ROUGE (signal vente)
 //                - Mouvement HAUT -> BAS  -> marque VERTE (signal achat)
 //
-//              Fenetre d'affichage [startHour - endHour] (defaut 08h-22h
+//              Fenetre d'affichage [start - end] h:min (defaut 08h00-22h00
 //              Europe/Paris). Reset journalier a minuit Paris.
 //
-// Note Pine : sur les bougies confirmees l'etat persiste normalement.
-//             En realtime, Pine re-execute le script depuis l'etat de la
-//             bougie precedente confirmee a chaque tick : un seul marker
-//             par minute en intra-bar (acceptable en 1 min).
+// Changelog:
+//   v2.2.0 - 2026-05-17
+//     - Force la timeframe M1 via request.security_lower_tf() quelle que
+//       soit la TF du chart. Permet d'utiliser un chart M5 / M15 / H1 pour
+//       le contexte tout en gardant la finesse de declenchement M1.
+//     - Etat encapsule dans un type 'State' mutable (pour permettre la
+//       mutation depuis la fonction de traitement par bougie M1).
+//     - Historique des bougies M1 maintenu dans des arrays locaux pour
+//       la detection de swing (les offsets [i] ne sont plus pertinents
+//       avec l'iteration par bougie M1).
+//     - Marker width reste base sur la TF du chart (pour rester visible
+//       quand on est sur une TF > M1).
+//     - Limitation : sur une TF chart > M1, les marques apparaissent
+//       au timestamp M1, donc au milieu des bougies du chart. C'est
+//       visuellement attendu.
+//
+//   v2.1.3 - 2026-05-17
+//     - Release initiale (port de la version Tradovate v2.1.3).
+//     - Detection swing native (leftBars/rightBars) sur la TF du chart.
+//     - Machine d'etats deux phases (searching, tracking).
+//     - Reset journalier Europe/Paris, fenetre horaire h+min.
+//     - Rendu via line.new (trait horizontal au prix de declenchement).
 
 //@version=6
 indicator("JCO Amplitude", "JCO Amplitude", overlay=true, max_lines_count=500)
@@ -77,198 +97,244 @@ lineWidth       = input.int(2,      "Epaisseur trait",                minval=1, 
 bullColor       = input.color(color.new(#00C853, 10), "Couleur haussiere (signal achat)",   group="Affichage")
 bearColor       = input.color(color.new(#FF1744, 10), "Couleur baissiere (signal vente)",   group="Affichage")
 
-// === State (persiste entre les bougies) ===
-var string phase           = "searching"   // "searching" | "tracking"
-var string direction       = na            // "up" (mvt haussier, marque rouge) | "down" (mvt baissier, marque verte)
-var float  activeAmpPts    = na
-var float  origin          = na
-var float  refExtreme      = na
-var float  oppExtreme      = na
-var float  localOpp        = na
-var float  recoveryExt     = na
-var bool   retracementSeen = false
-var string currentPath     = "amp2"        // "amp1" | "amp2"
-var float  swingPrice      = na
-var int    swingTime       = na
-var string swingType       = na            // "low" | "high"
+// === Type Etat (encapsule pour permettre la mutation depuis une fonction) ===
+type State
+    string phase           // "searching" | "tracking"
+    string direction       // "up" (mvt haussier, marque rouge) | "down"
+    float  activeAmpPts
+    float  origin
+    float  refExtreme
+    float  oppExtreme
+    float  localOpp
+    float  recoveryExt
+    bool   retracementSeen
+    string currentPath     // "amp1" | "amp2"
+    float  swingPrice
+    int    swingTime
+    string swingType       // "low" | "high"
+    int    lastDayKey      // sentinel pour le reset journalier
 
-// === Reset journalier (minuit Europe/Paris) ===
-// Pine v6 n'expose pas dayofyear() : on construit une cle unique annee*10000 + mois*100 + jour.
-dayKey = year(time, "Europe/Paris") * 10000 + month(time, "Europe/Paris") * 100 + dayofmonth(time, "Europe/Paris")
-dayChanged = ta.change(dayKey)
-if not na(dayChanged) and dayChanged != 0
-    phase           := "searching"
-    direction       := na
-    activeAmpPts    := na
-    origin          := na
-    refExtreme      := na
-    oppExtreme      := na
-    localOpp        := na
-    recoveryExt     := na
-    retracementSeen := false
-    currentPath     := "amp2"
-    swingPrice      := na
-    swingTime       := na
-    swingType       := na
+var State s = State.new(phase           = "searching",
+                         direction       = na,
+                         activeAmpPts    = na,
+                         origin          = na,
+                         refExtreme      = na,
+                         oppExtreme      = na,
+                         localOpp        = na,
+                         recoveryExt     = na,
+                         retracementSeen = false,
+                         currentPath     = "amp2",
+                         swingPrice      = na,
+                         swingTime       = na,
+                         swingType       = na,
+                         lastDayKey      = 0)
+
+// === Historique des bougies M1 (buffer local pour la detection swing) ===
+var array<float> hist_h = array.new<float>()
+var array<float> hist_l = array.new<float>()
+var array<int>   hist_t = array.new<int>()
+const int MAX_HIST = 200
 
 // === Helper de dessin ===
-// Trait horizontal au prix exact de declenchement, centre sur la bougie.
-f_drawMarker(triggerPrice, useBearColor) =>
+// Trait horizontal au prix de declenchement, centre sur le timestamp M1.
+// La largeur du trait reste basee sur la TF du chart (pour rester visible
+// quand on est sur une TF > M1).
+f_drawMarker(triggerPrice, useBearColor, t) =>
     tfSec = timeframe.in_seconds(timeframe.period)
     tfMs = (tfSec > 0 ? tfSec : 60) * 1000
     halfW = int(math.round(tfMs * markerWidthBars / 2.0))
     col = useBearColor ? bearColor : bullColor
-    line.new(x1=time - halfW, y1=triggerPrice, x2=time + halfW, y2=triggerPrice,
+    line.new(x1=t - halfW, y1=triggerPrice, x2=t + halfW, y2=triggerPrice,
              xloc=xloc.bar_time, color=col, width=lineWidth)
 
-// === Detection swing (phase searching uniquement) ===
-// pivot a `rightBars` bougies en arriere, strict vs leftBars a gauche
-// ET rightBars a droite. La bougie en cours (offset 0) compte comme
-// bougie de droite, comme dans la version Tradovate.
-if phase == "searching" and bar_index >= leftBars + rightBars
-    int pivotIdx = rightBars
-    float pivotHigh = high[pivotIdx]
-    float pivotLow  = low[pivotIdx]
-    bool isSwingLow  = true
-    bool isSwingHigh = true
-    for k = 1 to leftBars
-        if low[pivotIdx + k] <= pivotLow
-            isSwingLow := false
-        if high[pivotIdx + k] >= pivotHigh
-            isSwingHigh := false
-    for k = 1 to rightBars
-        if low[pivotIdx - k] <= pivotLow
-            isSwingLow := false
-        if high[pivotIdx - k] >= pivotHigh
-            isSwingHigh := false
-    int pivotTime = time[pivotIdx]
-    if isSwingLow
-        if na(swingTime) or swingTime != pivotTime or swingType != "low"
-            swingPrice := pivotLow
-            swingTime  := pivotTime
-            swingType  := "low"
-    else if isSwingHigh
-        if na(swingTime) or swingTime != pivotTime or swingType != "high"
-            swingPrice := pivotHigh
-            swingTime  := pivotTime
-            swingType  := "high"
+// === Traitement d'une bougie M1 ===
+// Pousse h/l/t dans le buffer, applique reset journalier, detection swing,
+// puis les regles d'amplitude.
+f_processBar(float h, float l, int t) =>
+    // 1) Push history + trim
+    array.push(hist_h, h)
+    array.push(hist_l, l)
+    array.push(hist_t, t)
+    if array.size(hist_h) > MAX_HIST
+        array.shift(hist_h)
+        array.shift(hist_l)
+        array.shift(hist_t)
 
-// === Verification amplitude ===
-minutesNow = hour(time, "Europe/Paris") * 60 + minute(time, "Europe/Paris")
-startMins  = startHour * 60 + startMinute
-endMins    = endHour   * 60 + endMinute
-inWindow   = minutesNow >= startMins and minutesNow < endMins
+    // 2) Reset journalier (minuit Europe/Paris) base sur le timestamp M1
+    int dk = year(t, "Europe/Paris") * 10000 + month(t, "Europe/Paris") * 100 + dayofmonth(t, "Europe/Paris")
+    if s.lastDayKey != 0 and dk != s.lastDayKey
+        s.phase           := "searching"
+        s.direction       := na
+        s.activeAmpPts    := na
+        s.origin          := na
+        s.refExtreme      := na
+        s.oppExtreme      := na
+        s.localOpp        := na
+        s.recoveryExt     := na
+        s.retracementSeen := false
+        s.currentPath     := "amp2"
+        s.swingPrice      := na
+        s.swingTime       := na
+        s.swingType       := na
+    s.lastDayKey := dk
 
-amp1Price = amp1Pts * pointSize
-amp2Price = amp2Pts * pointSize
+    // 3) Detection swing (phase searching uniquement)
+    if s.phase == "searching"
+        int n = array.size(hist_h)
+        if n >= leftBars + rightBars + 1
+            int pivotIdx = n - 1 - rightBars
+            float pivotHigh = array.get(hist_h, pivotIdx)
+            float pivotLow  = array.get(hist_l, pivotIdx)
+            bool isSwingLow  = true
+            bool isSwingHigh = true
+            for k = 1 to leftBars
+                if array.get(hist_l, pivotIdx - k) <= pivotLow
+                    isSwingLow := false
+                if array.get(hist_h, pivotIdx - k) >= pivotHigh
+                    isSwingHigh := false
+            for k = 1 to rightBars
+                if array.get(hist_l, pivotIdx + k) <= pivotLow
+                    isSwingLow := false
+                if array.get(hist_h, pivotIdx + k) >= pivotHigh
+                    isSwingHigh := false
+            int pivotTime = array.get(hist_t, pivotIdx)
+            if isSwingLow
+                if na(s.swingTime) or s.swingTime != pivotTime or s.swingType != "low"
+                    s.swingPrice := pivotLow
+                    s.swingTime  := pivotTime
+                    s.swingType  := "low"
+            else if isSwingHigh
+                if na(s.swingTime) or s.swingTime != pivotTime or s.swingType != "high"
+                    s.swingPrice := pivotHigh
+                    s.swingTime  := pivotTime
+                    s.swingType  := "high"
 
-if inWindow
-    // -------- Phase 1 : searching --------
-    if phase == "searching" and not na(swingPrice)
-        if swingType == "low"
-            float triggerPrice = swingPrice + amp1Price
-            if high >= triggerPrice
-                f_drawMarker(triggerPrice, true)   // mvt up -> marque ROUGE
-                phase           := "tracking"
-                direction       := "up"
-                origin          := swingPrice
-                activeAmpPts    := amp1Pts
-                refExtreme      := triggerPrice
-                oppExtreme      := triggerPrice
-                localOpp        := triggerPrice
-                recoveryExt     := triggerPrice
-                retracementSeen := false
-                currentPath     := "amp2"
-        else if swingType == "high"
-            float triggerPrice = swingPrice - amp1Price
-            if low <= triggerPrice
-                f_drawMarker(triggerPrice, false)  // mvt down -> marque VERTE
-                phase           := "tracking"
-                direction       := "down"
-                origin          := swingPrice
-                activeAmpPts    := amp1Pts
-                refExtreme      := triggerPrice
-                oppExtreme      := triggerPrice
-                localOpp        := triggerPrice
-                recoveryExt     := triggerPrice
-                retracementSeen := false
-                currentPath     := "amp2"
-    // -------- Phase 2 : tracking --------
-    else if phase == "tracking"
-        // 1) Mise a jour des extremes
-        bool oppDropped = false
-        if direction == "up"
-            if high > refExtreme
-                refExtreme := high
-                localOpp   := refExtreme    // reset localOpp sur nouveau plus haut
-            if low < localOpp
-                localOpp := low
-            if low < oppExtreme
-                oppExtreme      := low
-                recoveryExt     := low
-                retracementSeen := true
-                oppDropped      := true
-            if high > recoveryExt
-                recoveryExt := high
-        else
-            if low < refExtreme
-                refExtreme := low
-                localOpp   := refExtreme    // reset localOpp sur nouveau plus bas
-            if high > localOpp
-                localOpp := high
-            if high > oppExtreme
-                oppExtreme      := high
-                recoveryExt     := high
-                retracementSeen := true
-                oppDropped      := true
-            if low < recoveryExt
-                recoveryExt := low
+    // 4) Fenetre horaire
+    int minutesNow = hour(t, "Europe/Paris") * 60 + minute(t, "Europe/Paris")
+    int startMins  = startHour * 60 + startMinute
+    int endMins    = endHour   * 60 + endMinute
+    bool inWindow  = minutesNow >= startMins and minutesNow < endMins
 
-        // 2) Distances signees (toujours positives)
-        float retrace      = direction == "up" ? refExtreme  - oppExtreme  : oppExtreme - refExtreme
-        float localRetrace = direction == "up" ? refExtreme  - localOpp    : localOpp   - refExtreme
-        float recovery     = direction == "up" ? recoveryExt - oppExtreme  : oppExtreme - recoveryExt
-        float totalMove    = direction == "up" ? refExtreme  - origin      : origin     - refExtreme
+    if inWindow
+        float amp1Price = amp1Pts * pointSize
+        float amp2Price = amp2Pts * pointSize
 
-        // 3) Re-evaluation du path uniquement sur baisse d'oppExtreme
-        if oppDropped
-            currentPath := retrace > 0.30 * totalMove ? "amp1" : "amp2"
+        // -------- Phase 1 : searching --------
+        if s.phase == "searching" and not na(s.swingPrice)
+            if s.swingType == "low"
+                float triggerPrice = s.swingPrice + amp1Price
+                if h >= triggerPrice
+                    f_drawMarker(triggerPrice, true, t)
+                    s.phase           := "tracking"
+                    s.direction       := "up"
+                    s.origin          := s.swingPrice
+                    s.activeAmpPts    := amp1Pts
+                    s.refExtreme      := triggerPrice
+                    s.oppExtreme      := triggerPrice
+                    s.localOpp        := triggerPrice
+                    s.recoveryExt     := triggerPrice
+                    s.retracementSeen := false
+                    s.currentPath     := "amp2"
+            else if s.swingType == "high"
+                float triggerPrice = s.swingPrice - amp1Price
+                if l <= triggerPrice
+                    f_drawMarker(triggerPrice, false, t)
+                    s.phase           := "tracking"
+                    s.direction       := "down"
+                    s.origin          := s.swingPrice
+                    s.activeAmpPts    := amp1Pts
+                    s.refExtreme      := triggerPrice
+                    s.oppExtreme      := triggerPrice
+                    s.localOpp        := triggerPrice
+                    s.recoveryExt     := triggerPrice
+                    s.retracementSeen := false
+                    s.currentPath     := "amp2"
+        // -------- Phase 2 : tracking --------
+        else if s.phase == "tracking"
+            // 1) Mise a jour des extremes
+            bool oppDropped = false
+            if s.direction == "up"
+                if h > s.refExtreme
+                    s.refExtreme := h
+                    s.localOpp   := s.refExtreme
+                if l < s.localOpp
+                    s.localOpp := l
+                if l < s.oppExtreme
+                    s.oppExtreme      := l
+                    s.recoveryExt     := l
+                    s.retracementSeen := true
+                    oppDropped        := true
+                if h > s.recoveryExt
+                    s.recoveryExt := h
+            else
+                if l < s.refExtreme
+                    s.refExtreme := l
+                    s.localOpp   := s.refExtreme
+                if h > s.localOpp
+                    s.localOpp := h
+                if h > s.oppExtreme
+                    s.oppExtreme      := h
+                    s.recoveryExt     := h
+                    s.retracementSeen := true
+                    oppDropped        := true
+                if l < s.recoveryExt
+                    s.recoveryExt := l
 
-        // 4) Regles par priorite
-        bool markPlaced = false
+            // 2) Distances signees
+            float retrace      = s.direction == "up" ? s.refExtreme  - s.oppExtreme  : s.oppExtreme - s.refExtreme
+            float localRetrace = s.direction == "up" ? s.refExtreme  - s.localOpp    : s.localOpp   - s.refExtreme
+            float recovery     = s.direction == "up" ? s.recoveryExt - s.oppExtreme  : s.oppExtreme - s.recoveryExt
+            float totalMove    = s.direction == "up" ? s.refExtreme  - s.origin      : s.origin     - s.refExtreme
 
-        // Regle 1 : Reversal (seuil = amp1 TOUJOURS, requiert un vrai retracement)
-        if retracementSeen and localRetrace >= amp1Price
-            float revTrigger = direction == "up" ? refExtreme - amp1Price : refExtreme + amp1Price
-            string newDirection = direction == "up" ? "down" : "up"
-            bool useBearColor = newDirection == "up"
-            f_drawMarker(revTrigger, useBearColor)
-            float newOrigin = refExtreme
-            direction       := newDirection
-            origin          := newOrigin
-            activeAmpPts    := amp1Pts
-            refExtreme      := revTrigger
-            oppExtreme      := revTrigger
-            localOpp        := revTrigger
-            recoveryExt     := revTrigger
-            retracementSeen := false
-            currentPath     := "amp2"
-            markPlaced      := true
+            // 3) Re-evaluation du path uniquement sur baisse d'oppExtreme
+            if oppDropped
+                s.currentPath := retrace > 0.30 * totalMove ? "amp1" : "amp2"
 
-        // Regle 2 : Continuation (path-driven : amp1 ou amp2 selon currentPath)
-        if not markPlaced
-            float ampPathPrice = currentPath == "amp1" ? amp1Price : amp2Price
-            float ampPathPts   = currentPath == "amp1" ? amp1Pts   : amp2Pts
-            if recovery >= ampPathPrice
-                float contTrigger = direction == "up" ? oppExtreme + ampPathPrice : oppExtreme - ampPathPrice
-                bool useBearColor = direction == "up"
-                f_drawMarker(contTrigger, useBearColor)
-                float newOrigin = oppExtreme
-                origin          := newOrigin
-                activeAmpPts    := ampPathPts
-                refExtreme      := contTrigger
-                oppExtreme      := contTrigger
-                localOpp        := contTrigger
-                recoveryExt     := contTrigger
-                retracementSeen := false
-                currentPath     := "amp2"
+            // 4) Regles par priorite
+            bool markPlaced = false
+
+            // Regle 1 : Reversal (seuil = amp1 TOUJOURS, requiert un vrai retracement)
+            if s.retracementSeen and localRetrace >= amp1Price
+                float revTrigger = s.direction == "up" ? s.refExtreme - amp1Price : s.refExtreme + amp1Price
+                string newDirection = s.direction == "up" ? "down" : "up"
+                bool useBearColor = newDirection == "up"
+                f_drawMarker(revTrigger, useBearColor, t)
+                s.direction       := newDirection
+                s.origin          := s.refExtreme
+                s.activeAmpPts    := amp1Pts
+                s.refExtreme      := revTrigger
+                s.oppExtreme      := revTrigger
+                s.localOpp        := revTrigger
+                s.recoveryExt     := revTrigger
+                s.retracementSeen := false
+                s.currentPath     := "amp2"
+                markPlaced        := true
+
+            // Regle 2 : Continuation (path-driven : amp1 ou amp2 selon currentPath)
+            if not markPlaced
+                float ampPathPrice = s.currentPath == "amp1" ? amp1Price : amp2Price
+                float ampPathPts   = s.currentPath == "amp1" ? amp1Pts   : amp2Pts
+                if recovery >= ampPathPrice
+                    float contTrigger = s.direction == "up" ? s.oppExtreme + ampPathPrice : s.oppExtreme - ampPathPrice
+                    bool useBearColor = s.direction == "up"
+                    f_drawMarker(contTrigger, useBearColor, t)
+                    s.origin          := s.oppExtreme
+                    s.activeAmpPts    := ampPathPts
+                    s.refExtreme      := contTrigger
+                    s.oppExtreme      := contTrigger
+                    s.localOpp        := contTrigger
+                    s.recoveryExt     := contTrigger
+                    s.retracementSeen := false
+                    s.currentPath     := "amp2"
+
+// === Entry point ===
+// Force M1 quelle que soit la TF du chart. Si chart < M1 (sub-minute), on
+// retombe sur la TF du chart (impossible de descendre dessous).
+string forcedTf = timeframe.in_seconds(timeframe.period) >= 60 ? "1" : timeframe.period
+[m1_h_arr, m1_l_arr, m1_t_arr] = request.security_lower_tf(syminfo.tickerid, forcedTf, [high, low, time])
+
+if not na(m1_h_arr)
+    int n = array.size(m1_h_arr)
+    if n > 0
+        for i = 0 to n - 1
+            f_processBar(array.get(m1_h_arr, i), array.get(m1_l_arr, i), array.get(m1_t_arr, i))

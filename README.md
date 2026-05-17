@@ -14,19 +14,24 @@ swing pour signaler une zone de retournement potentielle :
 - **Mouvement BAS → HAUT** → marque **rouge** (signal vente contrarien)
 - **Mouvement HAUT → BAS** → marque **verte** (signal achat contrarien)
 
-## Pourquoi le 1 minute
+## Indépendance de la timeframe (depuis v2.2.0)
 
-La version Tradovate travaille en tick. Sur TradingView, on utilise
-les **high / low des bougies 1 min** pour approximer le tick-by-tick.
-La bougie en cours de formation est utilisée pour le dernier high/low
-et comme bougie de droite pour la détection de swing : déclenchement
-disponible **intra-bar**.
+La version Tradovate travaille en tick. Sur TradingView, on **force la
+M1** via `request.security_lower_tf()` quelle que soit la timeframe
+d'affichage du chart. Tu peux donc travailler sur un chart **M5, M15,
+H1...** pour le contexte, l'indicateur continue de calculer ses
+amplitudes sur les bougies M1 sous-jacentes et place les marques aux
+**instants et prix exacts** du déclenchement M1 (donc parfois au milieu
+d'une bougie sur les TF > M1, ce qui est attendu).
+
+Si la TF du chart est < M1 (sub-minute), l'indicateur retombe sur la TF
+du chart (impossible de descendre sous la TF d'affichage).
 
 > ⚠️ En realtime, Pine ré-exécute le script depuis l'état confirmé de la
-> bougie précédente à chaque tick. Conséquence : **maximum 1 marque par
-> bougie en intra-bar**. C'est acceptable en 1 min ; sur une session
-> normale on n'aura jamais 2 marques dans la même minute. Si tu as besoin
-> de plus de précision, passe en 30 s.
+> bougie chart précédente à chaque tick. Pour la bougie M1 en cours de
+> formation : maximum 1 marque par minute en intra-bar. Acceptable sur
+> les marchés visés ; sur une session normale on n'a jamais 2 marques
+> dans la même minute.
 
 ## Mécanique
 
@@ -79,7 +84,9 @@ visibles dans l'historique.
 1. Ouvrir TradingView → Pine Editor.
 2. Coller le contenu de [`Indicator_JCO_Amplitude.pine`](Indicator_JCO_Amplitude.pine).
 3. **Save** puis **Add to chart**.
-4. Recommandé : timeframe **1 minute** sur les futures indices.
+4. Depuis la v2.2.0 : **toute timeframe** ≥ M1 fonctionne (M1, M5, M15, H1...).
+   L'indicateur force la M1 en interne. Sub-minute (30 s, 15 s) : retombe
+   sur la TF du chart.
 
 ## Paramètres
 
@@ -118,6 +125,21 @@ sous les chandeliers selon l'ordre de rendu. Si nécessaire :
 Bring to front**.
 
 ## Changelog
+
+### v2.2.0 — 2026-05-17 (Pine)
+- **TF forcée M1** quelle que soit la timeframe du chart via
+  `request.security_lower_tf()`. Le chart peut être en M5, M15, H1... pour
+  le contexte ; les marques restent calculées et placées au tick M1.
+- État encapsulé dans un type `State` mutable (pour permettre la mutation
+  depuis la fonction de traitement par bougie M1).
+- Historique des bougies M1 maintenu dans des arrays locaux pour la
+  détection swing (les offsets `[i]` ne sont plus pertinents avec
+  l'itération par bougie M1).
+- Marker width reste basé sur la TF du chart (pour rester visible sur
+  les TF > M1).
+- Limitation visuelle : sur une TF chart > M1, les marques apparaissent
+  au timestamp M1 (au milieu des bougies du chart). C'est attendu et
+  reflète l'instant exact du déclenchement.
 
 ### v2.1.3 — 2026-05-17 (Pine)
 - Port initial Pine v6 de la version Tradovate v2.1.3.
