@@ -14,24 +14,32 @@ swing pour signaler une zone de retournement potentielle :
 - **Mouvement BAS → HAUT** → marque **rouge** (signal vente contrarien)
 - **Mouvement HAUT → BAS** → marque **verte** (signal achat contrarien)
 
-## Indépendance de la timeframe (depuis v2.2.0)
+## Résolution adaptative (depuis v2.2.0)
 
-La version Tradovate travaille en tick. Sur TradingView, on **force la
-M1** via `request.security_lower_tf()` quelle que soit la timeframe
-d'affichage du chart. Tu peux donc travailler sur un chart **M5, M15,
-H1...** pour le contexte, l'indicateur continue de calculer ses
-amplitudes sur les bougies M1 sous-jacentes et place les marques aux
-**instants et prix exacts** du déclenchement M1 (donc parfois au milieu
-d'une bougie sur les TF > M1, ce qui est attendu).
+La version Tradovate travaille en tick. Sur TradingView, l'indicateur
+adapte sa résolution de calcul à la timeframe du chart :
 
-Si la TF du chart est < M1 (sub-minute), l'indicateur retombe sur la TF
-du chart (impossible de descendre sous la TF d'affichage).
+- **Chart ≥ M1** (M1, M5, M15, H1...) → calcul **forcé sur les bougies
+  M1 sous-jacentes** via `request.security_lower_tf()`. C'est la
+  référence universelle : le comportement et les marques sont identiques
+  quelle que soit la TF d'affichage. Tu peux donc travailler sur un
+  chart M15 pour le contexte tout en gardant la finesse de déclenchement
+  M1 — les marques apparaissent aux **instants et prix exacts** du
+  déclenchement M1 (donc parfois au milieu d'une bougie sur les TF > M1,
+  c'est attendu et voulu).
+
+- **Chart < M1** (15s, 30s — nécessite un abonnement TradingView qui
+  débloque les sub-minute) → calcul **sur la TF du chart**, plus
+  précis encore que la M1. Les seuils `Amp1` / `Amp2` ayant été
+  calibrés pour la M1, à ajuster éventuellement à la baisse pour matcher
+  la granularité plus fine (sinon davantage de marques, dont certaines
+  bruitées).
 
 > ⚠️ En realtime, Pine ré-exécute le script depuis l'état confirmé de la
-> bougie chart précédente à chaque tick. Pour la bougie M1 en cours de
-> formation : maximum 1 marque par minute en intra-bar. Acceptable sur
-> les marchés visés ; sur une session normale on n'a jamais 2 marques
-> dans la même minute.
+> bougie chart précédente à chaque tick. Pour la bougie M1 (ou sub-minute)
+> en cours de formation : maximum 1 marque par bougie en intra-bar.
+> Acceptable sur les marchés visés ; sur une session normale on n'a
+> jamais 2 marques dans la même minute.
 
 ## Mécanique
 
@@ -84,9 +92,11 @@ visibles dans l'historique.
 1. Ouvrir TradingView → Pine Editor.
 2. Coller le contenu de [`Indicator_JCO_Amplitude.pine`](Indicator_JCO_Amplitude.pine).
 3. **Save** puis **Add to chart**.
-4. Depuis la v2.2.0 : **toute timeframe** ≥ M1 fonctionne (M1, M5, M15, H1...).
-   L'indicateur force la M1 en interne. Sub-minute (30 s, 15 s) : retombe
-   sur la TF du chart.
+4. **Toute timeframe** fonctionne. Sur chart ≥ M1, l'indicateur force la
+   M1 en interne (référence). Sur chart < M1 (abonnement TradingView
+   requis pour les sub-minute), il calcule sur la TF du chart pour un
+   déclenchement encore plus précis. Voir
+   [Résolution adaptative](#résolution-adaptative-depuis-v220).
 
 ## Paramètres
 
