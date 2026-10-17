@@ -80,6 +80,10 @@ Machine d'états par cycle (direction `up` ; symétrique en `down`) :
    - → marque `amp_path`, **même couleur** que la précédente
    - `origin ← oppExtreme`
 
+![Exemple : marque Amp1 puis continuation Amp2](assets/continuation_amp1_amp2.png)
+
+*Exemple : depuis le swing O, la 1ère marque est posée à `amp1` (≈100 pts). Le retracement C→D (−33) reste sous `amp1` : pas de reversal. La recovery D→E atteint `amp2` (≈60 pts) mesurée depuis `oppExtreme` (D) → marque de continuation, même couleur.*
+
 ### Reset journalier
 
 À minuit (heure **Europe/Paris**) : oubli du swing actif et de la
